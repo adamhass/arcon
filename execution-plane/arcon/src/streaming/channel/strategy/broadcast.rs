@@ -5,6 +5,7 @@ use crate::streaming::channel::strategy::{channel_output, ChannelStrategy};
 use crate::streaming::channel::Channel;
 use std::marker::PhantomData;
 
+#[derive(Clone)]
 pub struct Broadcast<A>
 where
     A: 'static + ArconType,

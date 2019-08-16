@@ -4,6 +4,7 @@ use crate::streaming::channel::strategy::*;
 use crate::streaming::channel::Channel;
 use std::marker::PhantomData;
 
+#[derive(Clone)]
 pub struct RoundRobin<A>
 where
     A: 'static + ArconType,

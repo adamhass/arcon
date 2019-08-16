@@ -13,6 +13,7 @@ use std::marker::PhantomData;
 ///
 /// `KeyBy` may be constructed with
 /// either a custom hasher or the default `FnvHasher`
+#[derive(Clone)]
 pub struct KeyBy<A, D = BuildHasherDefault<FnvHasher>>
 where
     A: 'static + ArconType + Hash,

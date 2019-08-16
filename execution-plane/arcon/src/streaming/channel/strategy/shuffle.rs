@@ -5,6 +5,7 @@ use crate::streaming::channel::Channel;
 use rand::seq::SliceRandom;
 use std::marker::PhantomData;
 
+#[derive(Clone)]
 pub struct Shuffle<A>
 where
     A: 'static + ArconType,

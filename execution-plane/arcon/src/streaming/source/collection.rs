@@ -1,4 +1,5 @@
-use crate::data::ArconType;
+use crate::streaming::channel::strategy::ChannelStrategy;
+use crate::data::{ArconType, ArconEvent, ArconElement};
 use kompact::*;
 use std::sync::Arc;
 /*
@@ -10,22 +11,25 @@ use std::sync::Arc;
 #[derive(ComponentDefinition)]
 pub struct CollectionSource<A: 'static + ArconType> {
     ctx: ComponentContext<CollectionSource<A>>,
-    subscriber: Arc<ActorRef>,
+    out_channels: Box<ChannelStrategy<A>>,
     collection: Vec<A>,
 }
 
 impl<A: ArconType> CollectionSource<A> {
-    pub fn new(collection: Vec<A>, subscriber: ActorRef) -> CollectionSource<A> {
+    pub fn new(collection: Vec<A>, out_channels: Box<ChannelStrategy<A>>) -> CollectionSource<A> {
         CollectionSource {
             ctx: ComponentContext::new(),
-            subscriber: Arc::new(subscriber),
+            out_channels,
             collection: collection,
         }
     }
-    pub fn process_collection(&self) {
-        let actor_ref = self.actor_ref();
+    pub fn process_collection(&mut self) {
         for element in &self.collection {
-            self.subscriber.tell(Arc::new(element.clone()), &actor_ref);
+            if let Err(err) = self.out_channels.output(
+                ArconEvent::Element(ArconElement::<A>::new(element.clone())),
+                &self.ctx.system()) {
+                error!(self.ctx.log(), "failed to send element: {}", err);
+            }
         }
     }
 }
@@ -53,7 +57,8 @@ impl<A: ArconType> Actor for CollectionSource<A> {
 mod tests {
     use super::*;
     use std::{thread, time};
-
+    use crate::streaming::channel::*;
+    use crate::streaming::channel::strategy::forward::*;
     // Stub for window-results
     mod sink {
         use super::*;
@@ -76,8 +81,13 @@ mod tests {
         }
         impl<A: ArconType> Actor for Sink<A> {
             fn receive_local(&mut self, _sender: ActorRef, msg: &Any) {
-                if let Some(m) = msg.downcast_ref::<A>() {
-                    self.result.push((*m).clone());
+                if let Some(m) = msg.downcast_ref::<ArconEvent<A>>() {
+                    match m {
+                        ArconEvent::Element(e) => {
+                            self.result.push(e.data);
+                        }
+                        _ => {}
+                    }
                 }
             }
             fn receive_message(&mut self, _sender: ActorPath, _ser_id: u64, _buf: &mut Buf) {}
@@ -112,9 +122,11 @@ mod tests {
         collection.push(123 as f32);
         collection.push(321.9 as f32);
 
-        let file_source: CollectionSource<f32> =
-            CollectionSource::new(collection, sink.actor_ref());
-        let (source, _) = system.create_and_register(move || file_source);
+        let collection_source: CollectionSource<f32> = CollectionSource::new(
+                collection, 
+                Box::new(Forward::<f32>::new(Channel::Local(sink.actor_ref())))
+        );
+        let (source, _) = system.create_and_register(move || collection_source);
         system.start(&source);
         wait(1);
 
