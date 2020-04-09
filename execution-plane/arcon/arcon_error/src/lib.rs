@@ -1,7 +1,8 @@
-use std::error::Error as StdError;
-use std::fmt;
+//! The arcon_error crate provide error utilities for Arcon related crates.
 
-/// Helper macro for generating an Arcon Error
+use std::{error::Error as StdError, fmt};
+
+/// Helper macro for generating an Error
 #[macro_export]
 macro_rules! arcon_err {
     ( $($arg:tt)* ) => ({
@@ -30,9 +31,7 @@ pub struct Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let msg = match self.kind {
-            ErrorKind::ArconError(ref err) => err,
-        };
+        let ErrorKind::ArconError(ref msg) = self.kind;
         write!(f, "{}", msg)
     }
 }
@@ -61,4 +60,5 @@ impl Error {
     }
 }
 
+/// A Result type for Arcon related crates
 pub type ArconResult<T> = ::std::result::Result<T, crate::Error>;

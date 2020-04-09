@@ -1,32 +1,42 @@
-extern crate tokio_codec;
+// Copyright (c) 2020, KTH Royal Institute of Technology.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 use kompact::prelude::*;
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::codec::Decoder;
-use tokio::net::TcpListener;
-use tokio::net::{UdpFramed, UdpSocket};
-use tokio::prelude::*;
-use tokio::runtime::Runtime;
-use tokio_codec::BytesCodec;
-
-use std::thread::{Builder, JoinHandle};
+use futures::StreamExt;
+use std::{net::SocketAddr, sync::Arc};
+use tokio::{
+    net::{TcpListener, UdpSocket},
+    runtime::Runtime,
+};
+use tokio_util::{
+    codec::{BytesCodec, Decoder},
+    udp::UdpFramed,
+};
 
 use bytes::BytesMut;
+use std::thread::{Builder, JoinHandle};
 
+/// Enum containing possible IO kinds
 pub enum IOKind {
-    Http,
     Tcp,
     Udp,
 }
 
+/// Events that an IO Component may send to its subscriber
 #[derive(Debug)]
-pub struct BytesRecv {
-    pub bytes: BytesMut,
+pub enum IOMessage {
+    /// Some raw bytes packed into a BytesMut
+    Bytes(BytesMut),
+    /// Indicates that the socket connection closed
+    SockClosed,
+    /// Indicates that an error occured
+    SockErr,
 }
-pub struct SockClosed {}
-pub struct SockErr {}
 
+/// A [kompact] Component listening to IO
+///
+/// Supports both TCP and UDP.
 #[derive(ComponentDefinition)]
 pub struct IO {
     ctx: ComponentContext<IO>,
@@ -34,25 +44,22 @@ pub struct IO {
 }
 
 impl IO {
-    pub fn udp(sock_addr: SocketAddr, subscriber: ActorRef<Box<dyn Any + Send>>) -> IO {
-        let subscriber = Arc::new(subscriber);
+    /// Creates a UDP IO component
+    pub fn udp(sock_addr: SocketAddr, subscriber: ActorRef<IOMessage>) -> IO {
         let th = Builder::new()
             .name(String::from("IOThread"))
             .spawn(move || {
                 let mut runtime = Runtime::new().expect("Could not create Tokio Runtime!");
-                let socket = UdpSocket::bind(&sock_addr).expect("Failed to bind");
 
-                let (_, reader) = UdpFramed::new(socket, BytesCodec::new()).split();
-                let handler = reader
-                    .for_each(move |(bytes, _from)| {
-                        let actor_ref = &*subscriber;
-                        actor_ref.tell(Box::new(BytesRecv { bytes }) as Box<dyn Any + Send>);
-                        Ok(())
-                    })
-                    .map_err(|_| ());
+                runtime.block_on(async move {
+                    let socket = UdpSocket::bind(&sock_addr).await.expect("Failed to bind");
 
-                runtime.spawn(handler);
-                runtime.shutdown_on_idle().wait().unwrap();
+                    let (_, mut reader) = UdpFramed::new(socket, BytesCodec::new()).split();
+
+                    while let Some(Ok((bytes, _from))) = reader.next().await {
+                        subscriber.tell(IOMessage::Bytes(bytes));
+                    }
+                });
             })
             .map_err(|_| ())
             .unwrap();
@@ -63,50 +70,58 @@ impl IO {
         }
     }
 
-    pub fn tcp(sock_addr: SocketAddr, subscriber: ActorRef<Box<dyn Any + Send>>) -> IO {
-        let subscriber = Arc::new(subscriber);
+    /// Creates a TCP IO component
+    pub fn tcp(sock_addr: SocketAddr, subscriber: ActorRef<IOMessage>) -> IO {
         let th = Builder::new()
             .name(String::from("IOThread"))
             .spawn(move || {
                 let mut runtime = Runtime::new().expect("Could not create Tokio Runtime!");
-                let executor = runtime.executor();
-                let listener = TcpListener::bind(&sock_addr).expect("failed to bind");
-                let handler = listener
-                    .incoming()
-                    .map_err(|e| println!("failed to accept socket; error = {:?}", e))
-                    .for_each(move |socket| {
+                let handle = runtime.handle().clone();
+                runtime.block_on(async move {
+                    let mut listener = TcpListener::bind(&sock_addr).await.expect("failed to bind");
+
+                    let mut incoming = listener.incoming();
+                    let subscriber = Arc::new(subscriber);
+                    'incoming: while let Some(socket_res) = incoming.next().await {
+                        let socket = match socket_res {
+                            Ok(s) => s,
+                            Err(_) => {
+                                // TODO: logging?
+                                continue 'incoming;
+                            }
+                        };
+
                         let framed = BytesCodec::new().framed(socket);
-                        let (_writer, reader) = framed.split();
+                        let (_writer, mut reader) = framed.split();
 
-                        let recv_sub = Arc::clone(&subscriber);
-                        let close_sub = Arc::clone(&subscriber);
-                        let err_sub = Arc::clone(&subscriber);
+                        let subscriber = Arc::clone(&subscriber);
+                        let processor = async move {
+                            let mut res = Ok(());
 
-                        let processor = reader
-                            .for_each(move |bytes| {
-                                let tcp_recv = BytesRecv { bytes };
-                                let actor_ref = &*recv_sub;
-                                actor_ref.tell(Box::new(tcp_recv) as Box<dyn Any + Send>);
-                                Ok(())
-                            })
-                            .and_then(move |()| {
-                                let actor_ref = &*close_sub;
-                                actor_ref.tell(Box::new(SockClosed {}) as Box<dyn Any + Send>);
-                                Ok(())
-                            })
-                            .or_else(move |err| {
-                                let actor_ref = &*err_sub;
-                                actor_ref.tell(Box::new(SockErr {}) as Box<dyn Any + Send>);
-                                Err(err)
-                            })
-                            .then(|_result| Ok(()));
+                            while let Some(read_res) = reader.next().await {
+                                match read_res {
+                                    Ok(bytes) => {
+                                        subscriber.tell(IOMessage::Bytes(bytes));
+                                    }
+                                    Err(e) => {
+                                        res = Err(e);
+                                    }
+                                }
+                            }
 
-                        executor.spawn(processor);
-                        Ok(())
-                    });
+                            match res {
+                                Ok(()) => {
+                                    subscriber.tell(IOMessage::SockClosed);
+                                }
+                                Err(_err) => {
+                                    subscriber.tell(IOMessage::SockErr);
+                                }
+                            }
+                        };
 
-                runtime.spawn(handler);
-                runtime.shutdown_on_idle().wait().unwrap();
+                        handle.spawn(processor);
+                    }
+                });
             })
             .map_err(|_| ())
             .unwrap();
@@ -117,16 +132,13 @@ impl IO {
         }
     }
 }
-
-unsafe impl Send for IO {}
-unsafe impl Sync for IO {}
 
 impl Provide<ControlPort> for IO {
     fn handle(&mut self, _event: ControlEvent) {}
 }
 
 impl Actor for IO {
-    type Message = Box<dyn Any + Send>;
+    type Message = ();
     fn receive_local(&mut self, _msg: Self::Message) {}
     fn receive_network(&mut self, _msg: NetMessage) {}
 }
@@ -134,13 +146,7 @@ impl Actor for IO {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use tokio::io;
-    use tokio::net::TcpStream;
-
-    pub enum IOKind {
-        Tcp,
-        Udp,
-    }
+    use tokio::{io::AsyncWriteExt, net::TcpStream};
 
     #[derive(ComponentDefinition)]
     pub struct IOSource {
@@ -162,16 +168,20 @@ pub mod tests {
     }
 
     impl Actor for IOSource {
-        type Message = Box<dyn Any + Send>;
+        type Message = IOMessage;
 
         fn receive_local(&mut self, msg: Self::Message) {
-            if let Some(ref recv) = msg.downcast_ref::<BytesRecv>() {
-                debug!(self.ctx.log(), "{:?}", recv.bytes);
-                self.received += 1;
-            } else if let Some(ref _close) = msg.downcast_ref::<SockClosed>() {
-                debug!(self.ctx.log(), "Sock connection closed");
-            } else if let Some(ref _err) = msg.downcast_ref::<SockErr>() {
-                error!(self.ctx.log(), " Sock IO Error");
+            match msg {
+                IOMessage::Bytes(bytes) => {
+                    debug!(self.ctx.log(), "{:?}", bytes);
+                    self.received += 1;
+                }
+                IOMessage::SockClosed => {
+                    debug!(self.ctx.log(), "Sock connection closed");
+                }
+                IOMessage::SockErr => {
+                    error!(self.ctx.log(), " Sock IO Error");
+                }
             }
         }
 
@@ -184,10 +194,12 @@ pub mod tests {
                 let system = self.ctx.system();
                 match self.kind {
                     IOKind::Tcp => {
-                        system.create_and_start(move || IO::tcp(self.sock_addr, self.actor_ref()));
+                        let comp = system.create(move || IO::tcp(self.sock_addr, self.actor_ref()));
+                        system.start(&comp);
                     }
                     IOKind::Udp => {
-                        system.create_and_start(move || IO::udp(self.sock_addr, self.actor_ref()));
+                        let comp = system.create(move || IO::udp(self.sock_addr, self.actor_ref()));
+                        system.start(&comp);
                     }
                 }
             }
@@ -204,12 +216,12 @@ pub mod tests {
         // Make sure IO::TCP is started
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let client = TcpStream::connect(&addr)
-            .and_then(|stream| io::write_all(stream, "hello\n").then(|_| Ok(())))
-            .map_err(|_| {
-                assert!(false);
-            });
-        tokio::run(client);
+        let client = async {
+            let mut stream = TcpStream::connect(&addr).await.expect("couldn't connect");
+            stream.write_all(b"hello\n").await.expect("write failed");
+        };
+
+        Runtime::new().unwrap().block_on(client);
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         // Our IOSource should have received 1 msg, that is, "hello"
@@ -225,12 +237,16 @@ pub mod tests {
         system.start(&io_source);
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let self_addr = "0.0.0.0:0".parse().unwrap();
-        let socket = UdpSocket::bind(&self_addr).expect("Failed to bind");
+        let client = async {
+            let self_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+            let mut socket = UdpSocket::bind(&self_addr).await.expect("Failed to bind");
 
-        let fmt_data = format!("{:?}\n", "test1");
-        let bytes = bytes::Bytes::from(fmt_data);
-        socket.send_dgram(bytes, &sock).wait().unwrap();
+            let fmt_data = format!("{:?}\n", "test1");
+            let bytes = bytes::Bytes::from(fmt_data);
+            socket.send_to(&bytes, &sock).await.unwrap();
+        };
+
+        Runtime::new().unwrap().block_on(client);
 
         std::thread::sleep(std::time::Duration::from_millis(100));
         let source = io_source.definition().lock().unwrap();

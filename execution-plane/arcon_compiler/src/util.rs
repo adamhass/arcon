@@ -1,6 +1,11 @@
-use arcon_spec::CompileMode;
-use std::fs::File;
-use std::process::{Command, Stdio};
+// Copyright (c) 2020, KTH Royal Institute of Technology.
+// SPDX-License-Identifier: AGPL-3.0-only
+
+use arcon_proto::arcon_spec::{get_compile_mode, ArconSpec};
+use std::{
+    fs::File,
+    process::{Command, Stdio},
+};
 
 pub fn target_list() -> Result<String, failure::Error> {
     let output = Command::new("rustc")
@@ -21,19 +26,16 @@ pub fn rustc_version() -> Result<String, failure::Error> {
     Ok(cmd_output(output))
 }
 
-pub fn cargo_build(
-    id: &str,
-    logged: Option<String>,
-    mode: &CompileMode,
-) -> Result<(), failure::Error> {
+pub fn cargo_build(spec: &ArconSpec, logged: Option<String>) -> Result<(), failure::Error> {
     let mut args: Vec<&str> = vec!["+nightly", "build"];
-    if mode == &CompileMode::Release {
-        args.push("--release");
+    let mode = get_compile_mode(spec);
+    if mode == "release" {
+        args.push("--release")
     }
 
     let mut cmd = {
         if let Some(log_dir) = logged {
-            let log_path = format!("{}/{}.log", log_dir, id);
+            let log_path = format!("{}/{}.log", log_dir, spec.id);
             let log_file = File::create(&log_path)?;
             let log_err = log_file.try_clone()?;
             Command::new("cargo")

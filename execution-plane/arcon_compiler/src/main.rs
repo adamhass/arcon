@@ -1,3 +1,6 @@
+// Copyright (c) 2020, KTH Royal Institute of Technology.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 #![feature(vec_remove_item)]
 #[macro_use]
 extern crate clap;
@@ -7,12 +10,14 @@ extern crate failure;
 #[macro_use]
 extern crate lazy_static;
 
-use arcon_spec::*;
+use arcon_proto::arcon_spec::{get_compile_mode, spec_from_file, ArconSpec};
 use clap::{App, AppSettings, Arg, SubCommand};
 use ferris_says::say;
-use std::fs::metadata;
-use std::io::{stdout, BufWriter};
-use std::str::FromStr;
+use std::{
+    fs::metadata,
+    io::{stdout, BufWriter},
+    str::FromStr,
+};
 
 mod env;
 mod repl;
@@ -30,7 +35,7 @@ const ARCON_VER: &str = "0.1"; // 0.1.x
 lazy_static! {
     static ref TARGETS: Vec<String> = {
         let targets = util::target_list().expect("Failed to fetch target list");
-        targets.split("\n").map(|x| x.to_string()).collect()
+        targets.split('\n').map(|x| x.to_string()).collect()
     };
     static ref RUSTC_VERSION: String =
         util::rustc_version().expect("Failed to fetch rustc version");
@@ -191,11 +196,13 @@ fn compile(
         if md.is_file() {
             spec_path.to_string()
         } else {
-            (spec_path.to_owned() + "/" + DEFAULT_SPEC)
+            spec_path.to_owned() + "/" + DEFAULT_SPEC
         }
     };
 
-    let spec = ArconSpec::load(&spec_file)?;
+    let spec = spec_from_file(&spec_file)?;
+
+    debug!("SPEC {:?}", spec);
 
     let mut env = env::CompilerEnv::load(build_dir.to_string())?;
 
@@ -211,14 +218,14 @@ fn compile(
     std::env::set_current_dir(&path)?;
 
     env.add_project(spec.id.clone())?;
-    env.create_workspace_member(&spec.id)?;
-    env.generate(&spec)?;
+    let features = env.generate(&spec)?;
+    env.create_workspace_member(&spec.id, &features)?;
 
     if daemonize {
         daemonize_arconc();
     } else {
-        let bin = env.bin_path(&spec.id, &spec.mode)?;
-        greeting_with_spec(&spec, &bin);
+        let bin = env.bin_path(&spec)?;
+        greeting_with_spec(&spec, &features, &bin);
     }
 
     let logged = if daemonize {
@@ -227,7 +234,7 @@ fn compile(
         None
     };
 
-    util::cargo_build(&spec.id, logged, &spec.mode)?;
+    util::cargo_build(&spec, logged)?;
 
     Ok(())
 }
@@ -259,19 +266,9 @@ fn repl() -> Result<(), failure::Error> {
     Ok(())
 }
 
-fn greeting_with_spec(spec: &ArconSpec, bin_path: &str) {
-    let mode = match spec.mode {
-        CompileMode::Debug => "debug",
-        CompileMode::Release => "release",
-    };
-
-    let features_str = {
-        if let Some(features) = spec.features.clone() {
-            features.join(",")
-        } else {
-            "default".to_string()
-        }
-    };
+fn greeting_with_spec(spec: &ArconSpec, features: &[String], bin_path: &str) {
+    let mode = get_compile_mode(spec);
+    let features_str = features.join(",");
 
     let msg = format!(
         "Wait while I compile {} for you!\n
@@ -282,7 +279,7 @@ fn greeting_with_spec(spec: &ArconSpec, bin_path: &str) {
     );
 
     let width: usize = msg
-        .split("\n")
+        .split('\n')
         .collect::<Vec<&str>>()
         .iter()
         .map(|m| m.len())

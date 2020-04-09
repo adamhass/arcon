@@ -1,11 +1,16 @@
+// Copyright (c) 2020, KTH Royal Institute of Technology.
+// SPDX-License-Identifier: AGPL-3.0-only
+
 #![allow(dead_code)]
 
-use arcon_spec::{ArconSpec, CompileMode};
+use arcon_proto::arcon_spec::{get_compile_mode, ArconSpec};
 use failure::Fail;
 use path_clean::PathClean;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Fail)]
 #[fail(display = "CompilerEnv: `{}`", msg)]
@@ -41,8 +46,7 @@ impl CompilerEnv {
                 members = []
                 "#;
                 std::fs::write(&manifest_file, default_manifest)?;
-                let config = toml::from_str(default_manifest)?;
-                config
+                toml::from_str(default_manifest)?
             }
         };
 
@@ -71,7 +75,7 @@ impl CompilerEnv {
             Err(CompileEnvError { msg: err_msg })
         } else {
             debug!("Adding Workspace member {}", id);
-            self.config.workspace.members.push(id.clone());
+            self.config.workspace.members.push(id);
             self.update_env()
                 .map_err(|e| CompileEnvError { msg: e.to_string() })
         }
@@ -89,8 +93,12 @@ impl CompilerEnv {
     }
 
     /// Creates a Workspace member with a Cargo.toml and src/ directory
-    pub fn create_workspace_member(&self, id: &str) -> Result<(), failure::Error> {
-        let full_path = format!("{}", id);
+    pub fn create_workspace_member(
+        &self,
+        id: &str,
+        features: &[String],
+    ) -> Result<(), failure::Error> {
+        let full_path = id.to_string();
 
         // Check if we are to use a local arcon crate or pull from crates.io
         let arcon_dependency = if self.local_arcon {
@@ -99,6 +107,16 @@ impl CompilerEnv {
             format!("version = \"{}\"", crate::ARCON_VER)
         };
 
+        let mut arcon_feature_str = String::new();
+        let mut to_format = features.len();
+        for feature in features {
+            arcon_feature_str += &format!("\"{}\"", feature);
+            if to_format > 1 {
+                arcon_feature_str += ",";
+            }
+            to_format -= 1;
+        }
+
         let manifest = format!(
             "[package] \
              \nname = \"{}\" \
@@ -106,13 +124,9 @@ impl CompilerEnv {
              \nauthors = [\"Arcon Developers <insert-email>\"] \
              \nedition = \"2018\" \
              \n[dependencies] \
-             \narcon = {{{}}} \
-             \nserde = {{version = \"1.0.63\", features = [\"derive\"] }}",
-            id, arcon_dependency
+             \narcon = {{{}, features = [{}]}}",
+            id, arcon_dependency, arcon_feature_str
         );
-
-        let path = format!("{}/src/", full_path);
-        std::fs::create_dir_all(path)?;
 
         let manifest_file = format!("{}/Cargo.toml", full_path);
         arcon_codegen::to_file(manifest, manifest_file)?;
@@ -120,20 +134,18 @@ impl CompilerEnv {
         Ok(())
     }
 
-    pub fn generate(&self, spec: &ArconSpec) -> Result<(), failure::Error> {
-        let code = arcon_codegen::generate(&spec, false)?;
-        let path = format!("{}/src/main.rs", spec.id);
-        arcon_codegen::to_file(code, path)?;
-        Ok(())
+    pub fn generate(&self, spec: &ArconSpec) -> Result<Vec<String>, failure::Error> {
+        let (code, features) = arcon_codegen::generate(spec, false)?;
+        let path = format!("{}/src/", spec.id);
+        std::fs::create_dir_all(path)?;
+        let main_rs = format!("{}/src/main.rs", spec.id);
+        arcon_codegen::to_file(code, main_rs)?;
+        Ok(features)
     }
 
-    pub fn bin_path(&self, id: &str, mode: &CompileMode) -> Result<String, failure::Error> {
-        let mode = match mode {
-            CompileMode::Debug => "debug",
-            CompileMode::Release => "release",
-        };
-
-        let path_str = format!("target/{}/{}", mode, id);
+    pub fn bin_path(&self, spec: &ArconSpec) -> Result<String, failure::Error> {
+        let mode = get_compile_mode(spec);
+        let path_str = format!("target/{}/{}", mode, spec.id);
         let path = std::path::Path::new(&path_str);
         let abs_path = self.absolute_path(path)?;
         Ok(abs_path.into_os_string().into_string().unwrap())
@@ -152,7 +164,7 @@ impl CompilerEnv {
     }
 
     pub fn destroy(&mut self) -> Result<(), failure::Error> {
-        let _ = fs::remove_dir_all(&self.root)?;
+        fs::remove_dir_all(&self.root)?;
         Ok(())
     }
 }
