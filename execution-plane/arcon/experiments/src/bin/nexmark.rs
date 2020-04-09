@@ -158,8 +158,12 @@ fn run(
 
     match nexmark_config.query {
         NEXMarkQuery::CurrencyConversion => {
-            info!("Running CurrencyConversion query");
+            info!("Running CurrencyConversion query (q1)");
             queries::q1::q1(debug_mode, nexmark_config, &mut pipeline);
+        }
+        NEXMarkQuery::Selection => {
+            info!("Running Selection query (q2)");
+            queries::q2::q2(debug_mode, nexmark_config, &mut pipeline);
         }
     }
 
